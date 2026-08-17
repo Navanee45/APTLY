@@ -11,8 +11,7 @@
 import type { ErrorResponse } from "@/types/api";
 
 const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ||
-  (typeof window !== "undefined" ? "" : "http://127.0.0.1:8000");
+  process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
 export class ApiError extends Error {
   constructor(
@@ -28,10 +27,50 @@ export class ApiError extends Error {
 
 async function parseErrorResponse(
   response: Response,
-): Promise<ErrorResponse["error"]> {
+): Promise<{ code: string; message: string; request_id: string }> {
   try {
-    const data = (await response.json()) as ErrorResponse;
-    return data.error;
+    const data = (await response.json()) as any;
+    if (data?.error && typeof data.error === "object") {
+      return {
+        code: data.error.code || "UNKNOWN_ERROR",
+        message: data.error.message || response.statusText || "An error occurred",
+        request_id: data.error.request_id || response.headers.get("x-request-id") || "",
+      };
+    }
+    if (typeof data?.detail === "string") {
+      return {
+        code: "HTTP_ERROR",
+        message: data.detail,
+        request_id: response.headers.get("x-request-id") || "",
+      };
+    }
+    if (Array.isArray(data?.detail)) {
+      const msg = data.detail.map((d: any) => d.msg || JSON.stringify(d)).join(", ");
+      return {
+        code: "VALIDATION_ERROR",
+        message: msg,
+        request_id: response.headers.get("x-request-id") || "",
+      };
+    }
+    if (typeof data?.detail === "object" && data?.detail?.message) {
+      return {
+        code: data.detail.code || "HTTP_ERROR",
+        message: data.detail.message,
+        request_id: response.headers.get("x-request-id") || "",
+      };
+    }
+    if (data?.message) {
+      return {
+        code: "ERROR",
+        message: data.message,
+        request_id: response.headers.get("x-request-id") || "",
+      };
+    }
+    return {
+      code: "HTTP_ERROR",
+      message: response.statusText || `Request failed with status ${response.status}`,
+      request_id: response.headers.get("x-request-id") || "",
+    };
   } catch {
     return {
       code: "UNKNOWN_ERROR",

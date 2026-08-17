@@ -12,15 +12,45 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import RedirectResponse, Response
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import UserContext, get_current_user
 from app.core.errors import StorageError
 from app.core.logging import get_logger
-from app.dependencies import get_storage
+from app.dependencies import get_db, get_storage
+from app.models.answer import Answer
+from app.models.interview import Interview
 from app.services.storage.base import StorageProvider
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/storage", tags=["Storage & Media Playback"])
+
+
+async def _require_owned_media(
+    storage_key: str,
+    user: UserContext,
+    db: AsyncSession,
+) -> None:
+    """Authorize media by its persisted answer/interview ownership, never its URL key."""
+    result = await db.execute(
+        select(Answer.id)
+        .join(Interview, Answer.interview_id == Interview.id)
+        .where(
+            Interview.user_id == user.id,
+            or_(
+                Answer.audio_storage_key == storage_key,
+                Answer.normalized_storage_key == storage_key,
+            ),
+        )
+        .limit(1)
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "MEDIA_NOT_FOUND", "message": "Media was not found."},
+        )
 
 
 @router.get(
@@ -30,9 +60,12 @@ router = APIRouter(prefix="/storage", tags=["Storage & Media Playback"])
 )
 async def get_media_stream(
     storage_key: str,
+    user: Annotated[UserContext, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     storage: Annotated[StorageProvider, Depends(get_storage)],
 ) -> Response:
     """Stream media file or redirect to temporary signed URL."""
+    await _require_owned_media(storage_key, user, db)
     try:
         # Try generating a signed URL first
         presigned = await storage.generate_presigned_url(storage_key, expires_in_seconds=3600)
@@ -79,9 +112,12 @@ async def get_media_stream(
 )
 async def sign_media_url(
     storage_key: str,
+    user: Annotated[UserContext, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     storage: Annotated[StorageProvider, Depends(get_storage)],
 ) -> dict[str, str]:
     """Generate temporary signed URL for client playback."""
+    await _require_owned_media(storage_key, user, db)
     try:
         presigned = await storage.generate_presigned_url(storage_key, expires_in_seconds=3600)
         return {
@@ -90,7 +126,8 @@ async def sign_media_url(
             "expires_at": presigned.expires_at.isoformat(),
         }
     except Exception as exc:
+        logger.warning("media_sign_failed", key=storage_key, error=str(exc))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"code": "STORAGE_SIGN_FAILED", "message": str(exc)},
+            detail={"code": "STORAGE_SIGN_FAILED", "message": "Could not prepare media playback."},
         ) from exc

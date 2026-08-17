@@ -50,6 +50,26 @@ def _get_interview_service(
     )
 
 
+async def _require_owned_interview(
+    interview_id: UUID,
+    user: UserContext,
+    service: InterviewService,
+) -> Any:
+    """Return an interview only when it belongs to the authenticated caller."""
+    detail = await service.get_interview_detail(interview_id)
+    if not detail:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "INTERVIEW_NOT_FOUND", "message": "Interview was not found."},
+        )
+    if detail.user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "FORBIDDEN", "message": "Access denied to this interview."},
+        )
+    return detail
+
+
 @router.post(
     "",
     response_model=InterviewDetailResponse,
@@ -140,9 +160,11 @@ async def get_interview(
 )
 async def start_interview(
     interview_id: UUID,
+    user: Annotated[UserContext, Depends(get_current_user)],
     service: InterviewService = Depends(_get_interview_service),
 ) -> InterviewDetailResponse:
     """Start the live interview."""
+    await _require_owned_interview(interview_id, user, service)
     interview = await service.start_interview(interview_id)
     return _to_detail_response(interview)
 
@@ -157,9 +179,16 @@ async def start_interview(
 async def create_answer(
     interview_id: UUID,
     payload: AnswerCreateRequest,
+    user: Annotated[UserContext, Depends(get_current_user)],
     service: InterviewService = Depends(_get_interview_service),
 ) -> AnswerResponse:
     """Create an answer record."""
+    interview = await _require_owned_interview(interview_id, user, service)
+    if payload.question_id not in {question.id for question in interview.questions}:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "QUESTION_NOT_FOUND", "message": "Question was not found in this interview."},
+        )
     answer = await service.create_answer(interview_id, payload.question_id)
     return _to_answer_response(answer)
 
@@ -174,12 +203,19 @@ async def upload_answer_audio(
     interview_id: UUID,
     answer_id: UUID,
     audio_file: Annotated[UploadFile, File(description="Binary audio recording file")],
+    user: Annotated[UserContext, Depends(get_current_user)],
     duration_seconds: Annotated[
         float, Form(description="Total recorded duration in seconds")
     ] = 0.0,
     service: InterviewService = Depends(_get_interview_service),
 ) -> AnswerResponse:
     """Upload recorded audio and process transcript/metrics."""
+    interview = await _require_owned_interview(interview_id, user, service)
+    if answer_id not in {answer.id for answer in interview.answers}:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "ANSWER_NOT_FOUND", "message": "Answer was not found in this interview."},
+        )
     audio_data = await audio_file.read()
     if len(audio_data) == 0:
         raise HTTPException(
@@ -209,9 +245,11 @@ async def upload_answer_audio(
 )
 async def next_question(
     interview_id: UUID,
+    user: Annotated[UserContext, Depends(get_current_user)],
     service: InterviewService = Depends(_get_interview_service),
 ) -> InterviewDetailResponse:
     """Advance to the next question."""
+    await _require_owned_interview(interview_id, user, service)
     interview = await service.advance_question(interview_id)
     return _to_detail_response(interview)
 
@@ -224,9 +262,11 @@ async def next_question(
 )
 async def finish_interview(
     interview_id: UUID,
+    user: Annotated[UserContext, Depends(get_current_user)],
     service: InterviewService = Depends(_get_interview_service),
 ) -> InterviewDetailResponse:
     """Finish the interview."""
+    await _require_owned_interview(interview_id, user, service)
     interview = await service.finish_interview(interview_id)
     return _to_detail_response(interview)
 

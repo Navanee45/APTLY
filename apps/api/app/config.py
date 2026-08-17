@@ -55,6 +55,10 @@ class Settings(BaseSettings):
         default="dev-insecure-secret-key-change-in-production",
         description="Must be overridden in production via SECRET_KEY env var",
     )
+    supabase_jwt_secret: str = Field(
+        default="",
+        description="Supabase Auth JWT secret for legacy HS256 projects; server-side only",
+    )
 
     # ── Database ───────────────────────────────────────────────
     database_url: str = Field(

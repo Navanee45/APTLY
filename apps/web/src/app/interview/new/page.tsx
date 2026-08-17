@@ -112,8 +112,8 @@ export default function NewInterviewPage() {
 
     try {
       const payload = {
-        job_id: analyzedJob?.id,
-        role_profile_id: roleProfile?.id,
+        job_id: analyzedJob?.id || undefined,
+        role_profile_id: roleProfile?.id || undefined,
         title: roleProfile?.role_title || jobTitle || "Practice Interview",
         interview_type: interviewType,
         difficulty_level: difficultyLevel,
