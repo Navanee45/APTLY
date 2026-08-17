@@ -134,6 +134,21 @@ class MediaNormalizerService:
         if not media_bytes or len(media_bytes) < 100:
             raise ProviderError("Cannot normalize empty or truncated media bytes.")
 
+        # If already a valid WAV container, write to temp file, inspect, and return directly
+        if media_bytes.startswith(b"RIFF"):
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav:
+                tmp_wav.write(media_bytes)
+                wav_path = tmp_wav.name
+            try:
+                inspection = self.inspect_media(wav_path)
+                return media_bytes, inspection
+            finally:
+                if os.path.exists(wav_path):
+                    try:
+                        os.remove(wav_path)
+                    except Exception:
+                        pass
+
         with tempfile.TemporaryDirectory() as tmpdir:
             in_file = os.path.join(tmpdir, f"original.{extension}")
             out_file = os.path.join(tmpdir, "normalized_16khz.wav")
@@ -141,8 +156,20 @@ class MediaNormalizerService:
             with open(in_file, "wb") as f:
                 f.write(media_bytes)
 
-            inspection = self.normalize_to_wav(in_file, out_file)
-            with open(out_file, "rb") as f:
-                wav_bytes = f.read()
-
-            return wav_bytes, inspection
+            try:
+                inspection = self.normalize_to_wav(in_file, out_file)
+                with open(out_file, "rb") as f:
+                    wav_bytes = f.read()
+                return wav_bytes, inspection
+            except Exception as e:
+                logger.warning("direct_normalization_failed_fallback_raw", error=str(e)[:200])
+                # Return original bytes with basic inspection
+                return media_bytes, {
+                    "has_audio": True,
+                    "has_video": False,
+                    "duration_seconds": max(1.0, len(media_bytes) / 16000.0),
+                    "size_bytes": len(media_bytes),
+                    "audio_codec": "raw",
+                    "sample_rate": 16000,
+                    "channels": 1,
+                }

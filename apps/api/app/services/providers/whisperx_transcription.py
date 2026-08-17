@@ -93,9 +93,16 @@ class WhisperXTranscriptionProvider(TranscriptionProvider):
         return self._model
 
     def _extract_audio_ffmpeg(self, input_bytes: bytes) -> str:
-        """Extract 16kHz mono PCM WAV from audio/video bytes using FFmpeg."""
+        """Extract 16kHz mono PCM WAV from audio/video bytes using FFmpeg or write directly."""
         import tempfile
 
+        # If audio is already a WAV container (starts with RIFF header), write directly to .wav
+        if input_bytes.startswith(b"RIFF"):
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
+                wav_file.write(input_bytes)
+                return wav_file.name
+
+        # Otherwise, write input container (webm/mp4/etc.) and extract PCM audio via FFmpeg
         with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as in_file:
             in_file.write(input_bytes)
             in_path = in_file.name
@@ -123,16 +130,20 @@ class WhisperXTranscriptionProvider(TranscriptionProvider):
                 check=False,
                 timeout=30,
             )
-            if result.returncode != 0 or not os.path.exists(out_path):
-                # Fallback: if conversion failed, try using in_path directly
-                return in_path
-            return out_path
-        finally:
-            if os.path.exists(in_path) and out_path != in_path:
+            if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                # Successfully converted; clean up raw container file
                 try:
                     os.remove(in_path)
-                except Exception as cleanup_err:
-                    logger.debug("temp_in_file_cleanup_failed", error=str(cleanup_err))
+                except Exception:
+                    pass
+                return out_path
+
+            # Conversion didn't produce valid out_path; return in_path without deleting it
+            logger.warning("ffmpeg_audio_extraction_non_zero", retcode=result.returncode, stderr=result.stderr.decode(errors="ignore")[:200])
+            return in_path
+        except Exception as exc:
+            logger.warning("ffmpeg_audio_extraction_failed", error=str(exc))
+            return in_path
 
     async def transcribe(
         self,
@@ -187,7 +198,7 @@ class WhisperXTranscriptionProvider(TranscriptionProvider):
                 detected_lang = info.language if hasattr(info, "language") else request.language
                 return full_text, all_words, duration, detected_lang
             finally:
-                if os.path.exists(temp_audio_path):
+                if temp_audio_path and os.path.exists(temp_audio_path):
                     try:
                         os.remove(temp_audio_path)
                     except Exception as cleanup_err:

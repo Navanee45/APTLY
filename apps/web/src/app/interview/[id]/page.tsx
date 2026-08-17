@@ -15,6 +15,7 @@ import {
 import { useMediaCapture } from "@/hooks/useMediaCapture";
 import { useInterviewWebSocket } from "@/hooks/useInterviewWebSocket";
 import { apiClient } from "@/lib/api-client";
+import { supabase } from "@/lib/supabase";
 import type { Answer, InterviewDetail, Question } from "@/types/interview";
 import {
   Video,
@@ -29,7 +30,74 @@ import {
   AlertTriangle,
   Volume2,
   Mic,
+  Brain,
+  Upload,
+  FileText,
+  Loader2,
+  RotateCcw,
 } from "lucide-react";
+
+// Processing stage shown during answer submission pipeline
+type ProcessingStage =
+  | "idle"
+  | "uploading"
+  | "normalizing"
+  | "transcribing"
+  | "analyzing"
+  | "deciding"
+  | "done"
+  | "failed";
+
+function ProcessingStatus({ stage }: { stage: ProcessingStage }) {
+  const stages: { id: ProcessingStage; label: string; icon: React.ReactNode }[] = [
+    { id: "uploading", label: "Uploading Recording", icon: <Upload className="h-3.5 w-3.5" /> },
+    { id: "normalizing", label: "Normalizing Audio", icon: <FileText className="h-3.5 w-3.5" /> },
+    { id: "transcribing", label: "Transcribing", icon: <Mic className="h-3.5 w-3.5" /> },
+    { id: "analyzing", label: "Gemini Analysis", icon: <Brain className="h-3.5 w-3.5" /> },
+    { id: "deciding", label: "Follow-Up Decision", icon: <Sparkles className="h-3.5 w-3.5" /> },
+  ];
+
+  const currentIdx = stages.findIndex((s) => s.id === stage);
+  if (currentIdx === -1 && stage !== "done") return null;
+
+  return (
+    <div className="mt-4 rounded-xl border border-indigo-500/20 bg-indigo-950/30 p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <Loader2 className="h-4 w-4 text-indigo-400 animate-spin" />
+        <span className="text-xs font-semibold text-indigo-300 uppercase tracking-wider">
+          Processing Your Answer
+        </span>
+      </div>
+      <div className="flex flex-col gap-2">
+        {stages.map((s, idx) => {
+          const isDone = currentIdx > idx || stage === "done";
+          const isCurrent = idx === currentIdx;
+          return (
+            <div
+              key={s.id}
+              className={`flex items-center gap-2 text-xs font-mono transition-all ${
+                isDone
+                  ? "text-emerald-400"
+                  : isCurrent
+                  ? "text-indigo-300 animate-pulse"
+                  : "text-slate-600"
+              }`}
+            >
+              {isDone ? (
+                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+              ) : isCurrent ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <div className="h-3.5 w-3.5 rounded-full border border-slate-700" />
+              )}
+              <span>{s.label}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 export default function LiveInterviewRoomPage() {
   const params = useParams<{ id: string }>();
@@ -39,6 +107,7 @@ export default function LiveInterviewRoomPage() {
   const [interview, setInterview] = useState<InterviewDetail | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [processingStage, setProcessingStage] = useState<ProcessingStage>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [currentAnswer, setCurrentAnswer] = useState<Answer | null>(null);
 
@@ -49,7 +118,8 @@ export default function LiveInterviewRoomPage() {
   // Question / Auto-Record Lifecycle State
   const [isTtsPlaying, setIsTtsPlaying] = useState(false);
   const [autoRecordCountdown, setAutoRecordCountdown] = useState<number | null>(null);
-  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  // Track which question IDs have already had TTS triggered to prevent re-triggering
+  const ttsTriggeredQuestionsRef = useRef<Set<string>>(new Set());
 
   // Unified Media Capture Hook
   const {
@@ -140,24 +210,30 @@ export default function LiveInterviewRoomPage() {
   const currentQIndex = (interview?.current_question_index || 0) + 1;
   const isLastQuestion = currentQIndex >= totalQuestions;
 
-  // Auto-Start Recording Trigger when Question becomes active & TTS completes
+  // Auto-Start TTS + Recording Trigger when Question becomes active
   useEffect(() => {
-    if (!hasConsent || isRecording || recordedBlob || isSubmitting || currentAnswer) {
-      return;
-    }
+    if (!hasConsent || !currentQuestion) return;
+    // Do not trigger if already answered or already recording
+    if (currentAnswer || isRecording || recordedBlob || isSubmitting) return;
+    // Do not trigger TTS for the same question twice
+    if (ttsTriggeredQuestionsRef.current.has(currentQuestion.id)) return;
 
-    // Play TTS audio or speech synthesizer for question
-    if (currentQuestion && typeof window !== "undefined" && "speechSynthesis" in window) {
+    // Mark this question as TTS-triggered
+    ttsTriggeredQuestionsRef.current.add(currentQuestion.id);
+
+    // Play TTS audio via browser speech synthesis
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
       setIsTtsPlaying(true);
       window.speechSynthesis.cancel();
 
       const utterance = new SpeechSynthesisUtterance(currentQuestion.question_text);
-      utterance.rate = 1.05;
+      utterance.rate = 1.0;
       utterance.pitch = 1.0;
+      utterance.volume = 1.0;
 
       utterance.onend = () => {
         setIsTtsPlaying(false);
-        // 400ms pre-roll preparation countdown before starting
+        // 3-second countdown before auto-recording
         setAutoRecordCountdown(3);
         const timer = setInterval(() => {
           setAutoRecordCountdown((prev) => {
@@ -168,17 +244,27 @@ export default function LiveInterviewRoomPage() {
             }
             return prev - 1;
           });
-        }, 300);
+        }, 1000);
       };
 
       utterance.onerror = () => {
         setIsTtsPlaying(false);
+        // TTS failed — still auto-start recording so interview isn't stuck
         void startRecording();
       };
 
-      window.speechSynthesis.speak(utterance);
+      // Small delay to ensure the component is fully rendered
+      const ttsTimeout = setTimeout(() => {
+        window.speechSynthesis.speak(utterance);
+      }, 500);
+
+      return () => {
+        clearTimeout(ttsTimeout);
+        window.speechSynthesis.cancel();
+      };
     }
-  }, [currentQuestion?.id, hasConsent, currentAnswer]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentQuestion?.id, hasConsent]);
 
   // Enforce Maximum Answer Duration (180s)
   useEffect(() => {
@@ -189,6 +275,7 @@ export default function LiveInterviewRoomPage() {
 
   // Handle Stop Recording
   const handleStopRecording = async () => {
+    setAutoRecordCountdown(null);
     await stopRecording();
   };
 
@@ -196,7 +283,16 @@ export default function LiveInterviewRoomPage() {
   const handleSubmitAnswer = async () => {
     if (!recordedBlob || !currentQuestion) return;
 
+    // Validate blob before uploading
+    if (recordedBlob.size < 1000) {
+      setErrorMessage(
+        `Recording is too small (${recordedBlob.size} bytes). Please record a longer answer.`,
+      );
+      return;
+    }
+
     setIsSubmitting(true);
+    setProcessingStage("uploading");
     setErrorMessage(null);
 
     try {
@@ -213,47 +309,114 @@ export default function LiveInterviewRoomPage() {
 
       // 2. Upload video/audio binary via FormData
       const formData = new FormData();
+      const extension = recordedBlob.type.includes("mp4") ? "mp4" : "webm";
       formData.append(
         "audio_file",
         recordedBlob,
-        `recording_${currentQuestion.id}.webm`,
+        `recording_${currentQuestion.id}.${extension}`,
       );
       formData.append("duration_seconds", String(recordingDuration || 5.0));
 
       const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-      const uploadRes = await fetch(
-        `${apiUrl}/api/v1/interviews/${interviewId}/answers/${answerId}/upload`,
-        {
-          method: "POST",
-          body: formData,
-        },
-      );
+
+      // Attach Supabase auth token
+      const uploadHeaders: Record<string, string> = {};
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (sessionData?.session?.access_token) {
+          uploadHeaders["Authorization"] = `Bearer ${sessionData.session.access_token}`;
+        }
+      } catch {
+        // Continue
+      }
+
+      // Use AbortController with a generous timeout for large video files
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120_000); // 2-minute timeout
+
+      let uploadRes: Response;
+      try {
+        uploadRes = await fetch(
+          `${apiUrl}/api/v1/interviews/${interviewId}/answers/${answerId}/upload`,
+          {
+            method: "POST",
+            headers: uploadHeaders,
+            body: formData,
+            signal: controller.signal,
+          },
+        );
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      setProcessingStage("transcribing");
 
       if (!uploadRes.ok) {
-        throw new Error("Failed to upload recording to storage.");
+        // Try to extract server error detail
+        let serverMsg = `Upload failed (HTTP ${uploadRes.status})`;
+        try {
+          const errData = (await uploadRes.json()) as {
+            error?: { message?: string; code?: string };
+            detail?: string;
+          };
+          if (errData?.error?.message) {
+            serverMsg = errData.error.message;
+          } else if (typeof errData?.detail === "string") {
+            serverMsg = errData.detail;
+          }
+        } catch {
+          // JSON parse failed; use generic message
+        }
+        throw new Error(serverMsg);
       }
+
+      setProcessingStage("analyzing");
 
       const processedAns = (await uploadRes.json()) as Answer;
       setCurrentAnswer(processedAns);
+
+      setProcessingStage("deciding");
 
       // Refresh interview data (picks up any Gemini adaptive follow-up inserted)
       const updated = await apiClient.get<InterviewDetail>(
         `/api/v1/interviews/${interviewId}`,
       );
       setInterview(updated);
+      setProcessingStage("done");
       resetRecording();
     } catch (err: unknown) {
-      setErrorMessage(
-        err instanceof Error ? err.message : "Error uploading and processing recording.",
-      );
+      setProcessingStage("failed");
+      if (err instanceof Error && err.name === "AbortError") {
+        setErrorMessage(
+          "Upload timed out. Your recording may be too large or the connection is slow. Please try again.",
+        );
+      } else {
+        setErrorMessage(
+          err instanceof Error
+            ? err.message
+            : "Error uploading and processing recording.",
+        );
+      }
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  // Retry after failure
+  const handleRetryAnswer = () => {
+    setProcessingStage("idle");
+    setErrorMessage(null);
+    resetRecording();
+    // Remove from triggered set so TTS fires again for this question
+    if (currentQuestion) {
+      ttsTriggeredQuestionsRef.current.delete(currentQuestion.id);
     }
   };
 
   // Advance to Next Question / Follow-up
   const handleNextQuestion = async () => {
     setIsSubmitting(true);
+    setProcessingStage("idle");
     setErrorMessage(null);
 
     try {
@@ -308,7 +471,7 @@ export default function LiveInterviewRoomPage() {
         ? "PROCESSED"
         : "READY",
       mimeType,
-      codec: "opus,vp9",
+      codec: "auto-detected",
       blobSizeBytes: recordedBlob?.size || 0,
       durationSeconds: recordingDuration,
       sha256Hash,
@@ -341,12 +504,15 @@ export default function LiveInterviewRoomPage() {
         <div className="flex min-h-[60vh] flex-col items-center justify-center gap-4 text-center">
           <div className="h-10 w-10 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent" />
           <p className="text-sm font-mono text-slate-400">
-            Initializing Realtime Interview Session & Video Engine...
+            Initializing Realtime Interview Session &amp; Video Engine...
           </p>
         </div>
       </AppShell>
     );
   }
+
+  const isAnswerSubmitted = Boolean(currentAnswer && currentAnswer.status !== "created");
+  const isFollowUp = currentQuestion?.question_source === "follow_up";
 
   return (
     <AppShell>
@@ -370,7 +536,8 @@ export default function LiveInterviewRoomPage() {
               {interview?.title || "Practice Interview Session"}
             </h1>
             <p className="text-xs text-slate-400">
-              {interview?.difficulty_level?.toUpperCase()} • {interview?.interview_type?.toUpperCase()}
+              {interview?.difficulty_level?.toUpperCase()} •{" "}
+              {interview?.interview_type?.toUpperCase()}
             </p>
           </div>
         </div>
@@ -410,15 +577,26 @@ export default function LiveInterviewRoomPage() {
         </div>
       </div>
 
+      {/* Error Banner */}
       {(errorMessage || mediaError) && (
         <div className="mb-6 flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-950/40 p-4 text-sm text-red-200 backdrop-blur-md">
           <AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
-          <div>
-            <p className="font-semibold">Camera / Microphone Notice</p>
-            <p className="text-xs text-red-300/90 mt-0.5">
-              {errorMessage || mediaError}
+          <div className="flex-1">
+            <p className="font-semibold">
+              {errorMessage ? "Recording / Upload Issue" : "Camera / Microphone Notice"}
             </p>
+            <p className="text-xs text-red-300/90 mt-0.5">{errorMessage || mediaError}</p>
           </div>
+          {errorMessage && processingStage === "failed" && (
+            <button
+              type="button"
+              onClick={handleRetryAnswer}
+              className="flex items-center gap-1.5 rounded-lg border border-red-500/40 bg-red-950/60 px-3 py-1.5 text-xs font-medium text-red-300 hover:bg-red-900/60 transition-colors"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              Retry Answer
+            </button>
+          )}
         </div>
       )}
 
@@ -429,12 +607,13 @@ export default function LiveInterviewRoomPage() {
           <Card className="glass-panel-glow p-8 min-h-[420px] flex flex-col justify-between">
             <div>
               <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="rounded-md border border-indigo-500/40 bg-indigo-950/60 px-2.5 py-1 text-xs font-semibold uppercase tracking-wider text-indigo-300">
                     {currentQuestion?.category || "Technical"}
                   </span>
-                  {currentQuestion?.question_source === "follow_up" && (
-                    <Badge variant="purple" className="text-xs">
+                  {isFollowUp && (
+                    <Badge variant="purple" className="text-xs flex items-center gap-1">
+                      <Brain className="h-3 w-3" />
                       Gemini Adaptive Follow-Up
                     </Badge>
                   )}
@@ -442,42 +621,86 @@ export default function LiveInterviewRoomPage() {
                     {currentQuestion?.competency || "Core Engineering"}
                   </span>
                 </div>
-                {isTtsPlaying && (
-                  <span className="flex items-center gap-1 text-xs font-mono text-cyan-400 animate-pulse">
-                    <Volume2 className="h-3.5 w-3.5" />
-                    Speaking Question...
-                  </span>
-                )}
-                {autoRecordCountdown !== null && (
-                  <span className="text-xs font-mono text-amber-400 font-bold animate-bounce">
-                    Auto-record in {autoRecordCountdown}...
-                  </span>
-                )}
+                <div className="flex items-center gap-2">
+                  {isTtsPlaying && (
+                    <span className="flex items-center gap-1 text-xs font-mono text-cyan-400 animate-pulse">
+                      <Volume2 className="h-3.5 w-3.5" />
+                      AI Speaking...
+                    </span>
+                  )}
+                  {autoRecordCountdown !== null && (
+                    <span className="text-xs font-mono text-amber-400 font-bold animate-bounce">
+                      Recording in {autoRecordCountdown}...
+                    </span>
+                  )}
+                </div>
               </div>
 
               <h2 className="text-2xl font-bold leading-relaxed text-slate-100 mt-4">
                 {currentQuestion?.question_text || "No active question."}
               </h2>
+
+              {/* Follow-up context indicator */}
+              {isFollowUp && currentQuestion?.target_competency && (
+                <div className="mt-4 flex items-center gap-2 text-xs font-mono text-purple-400">
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <span>
+                    Probing:{" "}
+                    <span className="font-semibold">{currentQuestion.target_competency}</span>
+                  </span>
+                </div>
+              )}
             </div>
 
             {/* Expected evaluation criteria preview */}
-            {currentQuestion?.expected_topics && currentQuestion.expected_topics.length > 0 && (
-              <div className="mt-8 rounded-xl border border-slate-800/80 bg-slate-950/60 p-4">
-                <p className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
-                  Key Focus Areas for this Question:
-                </p>
-                <div className="flex flex-wrap gap-2">
-                  {currentQuestion.expected_topics.map((topic, idx) => (
-                    <span
-                      key={idx}
-                      className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 border border-slate-800 px-2.5 py-1 text-xs text-slate-300"
-                    >
-                      <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
-                      {topic}
-                    </span>
-                  ))}
+            {currentQuestion?.expected_topics &&
+              currentQuestion.expected_topics.length > 0 && (
+                <div className="mt-8 rounded-xl border border-slate-800/80 bg-slate-950/60 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">
+                    Key Focus Areas:
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {currentQuestion.expected_topics.map((topic, idx) => (
+                      <span
+                        key={idx}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 border border-slate-800 px-2.5 py-1 text-xs text-slate-300"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
+                        {topic}
+                      </span>
+                    ))}
+                  </div>
                 </div>
+              )}
+
+            {/* Answer submitted / transcribed state */}
+            {isAnswerSubmitted && currentAnswer && (
+              <div className="mt-4">
+                {currentAnswer.status === "transcribed" ? (
+                  <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/40 p-3.5">
+                    <div className="flex items-center gap-2 text-emerald-400 font-semibold text-xs mb-1">
+                      <CheckCircle2 className="h-4 w-4" />
+                      <span>Answer Transcribed &amp; Analyzed by Gemini</span>
+                    </div>
+                    <p className="text-xs text-slate-300 font-mono">
+                      {currentAnswer.speech_metrics && (
+                        <>
+                          Speech rate: {currentAnswer.speech_metrics.wpm} WPM •{" "}
+                          {currentAnswer.speech_metrics.filler_count} fillers •{" "}
+                          {currentAnswer.transcript?.word_count || 0} words
+                        </>
+                      )}
+                    </p>
+                  </div>
+                ) : (
+                  <ProcessingStatus stage={processingStage} />
+                )}
               </div>
+            )}
+
+            {/* Processing status during submission */}
+            {isSubmitting && processingStage !== "idle" && processingStage !== "done" && (
+              <ProcessingStatus stage={processingStage} />
             )}
           </Card>
         </div>
@@ -493,7 +716,7 @@ export default function LiveInterviewRoomPage() {
                   }`}
                 />
                 <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
-                  {isRecording ? "Recording Your Answer" : "Live Video & Audio Capture"}
+                  {isRecording ? "🔴 Recording Answer" : "Live Video & Audio Capture"}
                 </h3>
               </div>
               <div className="flex items-center gap-3 font-mono text-sm">
@@ -542,15 +765,17 @@ export default function LiveInterviewRoomPage() {
 
             {/* Recording Controls */}
             <div className="mt-4 flex flex-col gap-3">
-              {!isRecording && !recordedBlob && (
+              {!isRecording && !recordedBlob && !isAnswerSubmitted && (
                 <button
                   type="button"
                   onClick={startRecording}
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || isTtsPlaying}
                   className="inline-flex items-center justify-center gap-2.5 rounded-xl bg-gradient-to-r from-red-500 to-rose-600 px-6 py-3.5 text-sm font-bold text-white shadow-lg shadow-red-500/20 transition-all hover:from-red-400 hover:to-rose-500 hover:shadow-red-500/30 disabled:opacity-50"
                 >
                   <Video className="h-5 w-5" />
-                  <span>Start Recording Answer</span>
+                  <span>
+                    {isTtsPlaying ? "Wait for question to finish..." : "Start Recording Answer"}
+                  </span>
                 </button>
               )}
 
@@ -565,8 +790,15 @@ export default function LiveInterviewRoomPage() {
                 </button>
               )}
 
-              {recordedBlob && !isRecording && (
+              {recordedBlob && !isRecording && !isAnswerSubmitted && (
                 <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-xs font-mono text-slate-400 bg-slate-900/60 border border-slate-800 rounded-lg px-3 py-2">
+                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                    <span>
+                      Recording ready: {(recordedBlob.size / 1024).toFixed(0)} KB •{" "}
+                      {recordingDuration.toFixed(1)}s • {mimeType.split(";")[0]}
+                    </span>
+                  </div>
                   <div className="flex gap-2">
                     <button
                       type="button"
@@ -586,31 +818,25 @@ export default function LiveInterviewRoomPage() {
                     >
                       {isSubmitting ? (
                         <>
-                          <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                          <span>Normalizing & Evaluating with Gemini...</span>
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          <span>
+                            {processingStage === "uploading"
+                              ? "Uploading..."
+                              : processingStage === "transcribing"
+                              ? "Transcribing..."
+                              : processingStage === "analyzing"
+                              ? "Gemini Analyzing..."
+                              : "Processing..."}
+                          </span>
                         </>
                       ) : (
                         <>
                           <Send className="h-3.5 w-3.5" />
-                          <span>Submit & Analyze</span>
+                          <span>Submit &amp; Analyze with Gemini</span>
                         </>
                       )}
                     </button>
                   </div>
-                </div>
-              )}
-
-              {/* Already Submitted / Processed State */}
-              {currentAnswer && currentAnswer.status === "transcribed" && (
-                <div className="mt-2 rounded-xl border border-emerald-500/30 bg-emerald-950/40 p-3.5">
-                  <div className="flex items-center gap-2 text-emerald-400 font-semibold text-xs mb-1">
-                    <CheckCircle2 className="h-4 w-4" />
-                    <span>Answer Transcribed & Verified</span>
-                  </div>
-                  <p className="text-xs text-slate-300 font-mono">
-                    Speech rate: {currentAnswer.speech_metrics?.wpm} WPM •{" "}
-                    {currentAnswer.speech_metrics?.filler_count} Fillers detected
-                  </p>
                 </div>
               )}
             </div>
@@ -637,15 +863,15 @@ export default function LiveInterviewRoomPage() {
             className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 px-8 py-3.5 text-sm font-bold text-slate-950 shadow-lg shadow-emerald-500/20 hover:from-emerald-400 hover:to-teal-400"
           >
             <Sparkles className="h-4 w-4 text-slate-950" />
-            <span>Complete Interview & Review Metrics</span>
+            <span>Complete Interview &amp; Review Metrics</span>
             <ArrowRight className="h-4 w-4 text-slate-950" />
           </button>
         ) : (
           <button
             type="button"
             onClick={handleNextQuestion}
-            disabled={isSubmitting}
-            className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-indigo-500 to-cyan-600 px-8 py-3.5 text-sm font-bold text-white shadow-lg shadow-indigo-500/20 hover:from-indigo-400 hover:to-cyan-500 disabled:opacity-50"
+            disabled={isSubmitting || (!isAnswerSubmitted && !recordedBlob)}
+            className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-indigo-500 to-cyan-600 px-8 py-3.5 text-sm font-bold text-white shadow-lg shadow-indigo-500/20 hover:from-indigo-400 hover:to-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <span>Next Question</span>
             <ArrowRight className="h-4 w-4" />

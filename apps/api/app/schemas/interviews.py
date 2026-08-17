@@ -36,6 +36,9 @@ class QuestionResponse(AptlyBaseModel):
     question_text: str
     expected_topics: list[str] = Field(default_factory=list)
     prompt_version: str = "v1"
+    question_source: str = "generated"  # "generated" | "follow_up" | "adaptive"
+    follow_up_depth: int = 0
+    target_competency: str | None = None
 
 
 # ── Transcript & Speech Metrics Schemas ───────────────────────────────────────
@@ -71,6 +74,7 @@ class SpeechMetricsResponse(VersionedSchema):
     pause_count: int
     total_pause_seconds: float
     pauses: list[PauseOccurrence] = Field(default_factory=list)
+    voice_energy: dict[str, Any] | None = None
     created_at: datetime
 
 
@@ -140,6 +144,7 @@ class AnswerResponse(AptlyBaseModel):
     ended_at: datetime | None = None
     audio_storage_key: str | None = None
     audio_size_bytes: int | None = None
+    playback_url: str | None = None
     transcript: TranscriptResponse | None = None
     speech_metrics: SpeechMetricsResponse | None = None
     content_metrics: ContentMetricsResponse | None = None
@@ -217,4 +222,7 @@ class InterviewReviewResponse(VersionedSchema):
     average_content_score: float = 0.0
     average_relevance_score: float = 0.0
     average_technical_depth_score: float = 0.0
+    overall_delivery_score: float = 0.0
+    overall_composite_score: float = 0.0
+    top_habits: list[dict[str, Any]] = Field(default_factory=list)
     questions_review: list[QuestionReviewItem] = Field(default_factory=list)

@@ -76,13 +76,23 @@ class QuestionGeneratorService:
             f"Generate exactly {question_count} distinct questions."
         )
 
-        raw_result = await self.llm_provider.generate_structured(
-            LLMStructuredRequest(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                output_schema=schema,
+        raw_result: dict = {}
+        try:
+            raw_result = await self.llm_provider.generate_structured(
+                LLMStructuredRequest(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    output_schema=schema,
+                )
             )
-        )
+        except Exception as llm_err:
+            logger.warning(
+                "question_generation_llm_failed_using_templates",
+                interview_id=str(interview_id),
+                error=str(llm_err)[:200],
+                provider=getattr(self.llm_provider, "PROVIDER_NAME", "unknown"),
+            )
+            # Fall through with empty dict → _parse_or_synthesize will use templates
 
         # Parse or synthesize question definitions
         question_defs = self._parse_or_synthesize(

@@ -147,7 +147,7 @@ async def get_storage(
 def _get_llm_provider_instance(
     provider: str,
     api_key: str = "",
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-flash-latest",
 ) -> LLMProvider:
     """Create and cache the LLM provider (singleton)."""
     if provider == "mock":
@@ -159,7 +159,7 @@ def _get_llm_provider_instance(
         logger.info("llm_provider_init", provider="gemini", model=model)
         return GeminiLLMProvider(
             api_key=api_key,
-            model=model or "gemini-2.5-flash",
+            model=model or "gemini-flash-latest",
         )
     msg = f"LLM provider '{provider}' is not supported. Use 'gemini' or 'mock'."
     raise NotImplementedError(msg)
@@ -251,4 +251,23 @@ async def get_transcription_provider(
         settings.whisperx_model,
         settings.whisperx_device,
         settings.whisperx_compute_type,
+    )
+
+
+get_llm = get_llm_provider
+
+
+async def get_interview_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    llm: Annotated[LLMProvider, Depends(get_llm_provider)],
+    transcription: Annotated[TranscriptionProvider, Depends(get_transcription_provider)],
+    storage: Annotated[StorageProvider, Depends(get_storage)],
+) -> Any:
+    """FastAPI dependency: returns initialized InterviewService."""
+    from app.services.interview_service import InterviewService
+    return InterviewService(
+        db_session=db,
+        llm_provider=llm,
+        transcription_provider=transcription,
+        storage_provider=storage,
     )

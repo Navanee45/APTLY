@@ -50,6 +50,22 @@ DEFAULT_PAUSE_THRESHOLD_SECONDS = 2.0
 
 
 @dataclass
+class VoiceEnergyPoint:
+    timestamp_seconds: float
+    energy: float  # 0.0 to 100.0
+
+
+@dataclass
+class VoiceEnergyAnalysis:
+    average_energy: float
+    energy_variance: float
+    opening_energy: float
+    middle_energy: float
+    closing_energy: float
+    timeline: list[dict[str, float]]
+
+
+@dataclass
 class ComputedSpeechMetrics:
     """Result of deterministic speech analysis."""
 
@@ -62,6 +78,7 @@ class ComputedSpeechMetrics:
     pause_count: int
     total_pause_seconds: float
     pauses: list[dict[str, Any]]
+    voice_energy: VoiceEnergyAnalysis | None = None
 
 
 class SpeechMetricsService:
@@ -230,4 +247,107 @@ class SpeechMetricsService:
             pause_count=len(detected_pauses),
             total_pause_seconds=round(total_pause_seconds, 2),
             pauses=detected_pauses,
+        )
+
+    def compute_voice_energy(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int = 16000,
+        frame_duration_ms: int = 500,
+    ) -> VoiceEnergyAnalysis:
+        """
+        Calculate frame-level RMS voice energy from 16-bit PCM WAV audio bytes.
+        """
+        import math
+        import struct
+
+        # Extract PCM samples (skip 44-byte WAV header if present)
+        pcm_data = audio_bytes[44:] if audio_bytes.startswith(b"RIFF") else audio_bytes
+        sample_count = len(pcm_data) // 2
+
+        if sample_count == 0:
+            return VoiceEnergyAnalysis(
+                average_energy=0.0,
+                energy_variance=0.0,
+                opening_energy=0.0,
+                middle_energy=0.0,
+                closing_energy=0.0,
+                timeline=[],
+            )
+
+        # Unpack 16-bit signed little-endian integers
+        try:
+            samples = struct.unpack(f"<{sample_count}h", pcm_data[: sample_count * 2])
+        except Exception:
+            return VoiceEnergyAnalysis(
+                average_energy=0.0,
+                energy_variance=0.0,
+                opening_energy=0.0,
+                middle_energy=0.0,
+                closing_energy=0.0,
+                timeline=[],
+            )
+
+        samples_per_frame = int(sample_rate * (frame_duration_ms / 1000.0))
+        if samples_per_frame == 0:
+            samples_per_frame = 8000
+
+        timeline: list[dict[str, float]] = []
+        raw_energies: list[float] = []
+
+        for i in range(0, len(samples), samples_per_frame):
+            frame = samples[i : i + samples_per_frame]
+            if not frame:
+                continue
+
+            sum_sq = sum(s * s for s in frame)
+            rms = math.sqrt(sum_sq / len(frame))
+            # Normalize 16-bit integer (max ~32768) to 0.0 - 100.0 scale
+            normalized_energy = round(min(100.0, (rms / 32768.0) * 100.0 * 3.5), 1)
+            ts = round(i / sample_rate, 2)
+            timeline.append({"timestamp_seconds": ts, "energy": normalized_energy})
+            raw_energies.append(normalized_energy)
+
+        if not raw_energies:
+            return VoiceEnergyAnalysis(
+                average_energy=0.0,
+                energy_variance=0.0,
+                opening_energy=0.0,
+                middle_energy=0.0,
+                closing_energy=0.0,
+                timeline=[],
+            )
+
+        avg_energy = round(sum(raw_energies) / len(raw_energies), 1)
+        variance = (
+            round(sum((e - avg_energy) ** 2 for e in raw_energies) / len(raw_energies), 1)
+            if len(raw_energies) > 1
+            else 0.0
+        )
+
+        n = len(raw_energies)
+        opening_split = max(1, int(n * 0.2))
+        closing_split = max(1, int(n * 0.8))
+
+        opening_energy = round(sum(raw_energies[:opening_split]) / opening_split, 1)
+        closing_count = n - closing_split
+        closing_energy = (
+            round(sum(raw_energies[closing_split:]) / closing_count, 1)
+            if closing_count > 0
+            else avg_energy
+        )
+        middle_count = closing_split - opening_split
+        middle_energy = (
+            round(sum(raw_energies[opening_split:closing_split]) / middle_count, 1)
+            if middle_count > 0
+            else avg_energy
+        )
+
+        return VoiceEnergyAnalysis(
+            average_energy=avg_energy,
+            energy_variance=variance,
+            opening_energy=opening_energy,
+            middle_energy=middle_energy,
+            closing_energy=closing_energy,
+            timeline=timeline,
         )

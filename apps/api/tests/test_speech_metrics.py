@@ -88,3 +88,26 @@ def test_speech_metrics_pause_detection() -> None:
     assert res.pauses[0]["duration_seconds"] == 2.5
     assert res.pauses[1]["duration_seconds"] == 3.0
     assert res.total_pause_seconds == 5.5
+
+
+def test_speech_metrics_voice_energy_calculation() -> None:
+    service = SpeechMetricsService()
+
+    # Empty audio bytes
+    res_empty = service.compute_voice_energy(b"")
+    assert res_empty.average_energy == 0.0
+    assert len(res_empty.timeline) == 0
+
+    # Synthetic 16-bit PCM WAV (1 second of sine wave audio at 16kHz)
+    import math
+    import struct
+
+    samples = [int(15000 * math.sin(2 * math.pi * 440 * i / 16000)) for i in range(16000)]
+    raw_pcm = struct.pack(f"<{len(samples)}h", *samples)
+
+    res = service.compute_voice_energy(raw_pcm, sample_rate=16000, frame_duration_ms=500)
+    assert res.average_energy > 0.0
+    assert len(res.timeline) == 2
+    assert res.opening_energy > 0.0
+    assert res.middle_energy > 0.0
+    assert res.closing_energy > 0.0

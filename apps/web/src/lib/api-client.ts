@@ -41,6 +41,8 @@ async function parseErrorResponse(
   }
 }
 
+import { supabase } from "@/lib/supabase";
+
 interface RequestOptions extends RequestInit {
   requestId?: string;
 }
@@ -52,9 +54,21 @@ async function request<T>(
   const { requestId, ...fetchOptions } = options;
 
   const headers = new Headers(fetchOptions.headers);
-  headers.set("Content-Type", "application/json");
+  if (!headers.has("Content-Type") && !(fetchOptions.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
   if (requestId) {
     headers.set("X-Request-ID", requestId);
+  }
+
+  // Inject Supabase JWT session token if available
+  try {
+    const { data } = await supabase.auth.getSession();
+    if (data?.session?.access_token && !headers.has("Authorization")) {
+      headers.set("Authorization", `Bearer ${data.session.access_token}`);
+    }
+  } catch {
+    // In SSR or unauthenticated state, proceed without token
   }
 
   const response = await fetch(`${API_BASE_URL}${path}`, {

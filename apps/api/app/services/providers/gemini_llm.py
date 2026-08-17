@@ -40,11 +40,11 @@ class GeminiLLMProvider(LLMProvider):
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-flash-latest",
         timeout_seconds: float = 30.0,
     ) -> None:
         self.api_key = api_key
-        self.model = model or "gemini-2.5-flash"
+        self.model = model or "gemini-flash-latest"
         self.MODEL_NAME = self.model
         self.timeout = timeout_seconds
 

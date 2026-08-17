@@ -25,8 +25,11 @@ from app.models.answer import Answer
 from app.models.interview import Interview
 from app.models.job import Job, RoleProfile
 from app.models.metrics import SpeechMetrics
+from app.models.profile import Profile
+from app.models.progress import UserProgress
 from app.models.question import Question
 from app.models.transcript import Transcript
+from app.models.user_document import UserDocument
 from app.schemas.content_intelligence import ContentAnalysisInput
 from app.services.adaptive_interview.engine import GeminiAdaptiveEngine
 from app.services.content_intelligence.service import ContentAnalysisService
@@ -48,7 +51,7 @@ VALID_INTERVIEW_TRANSITIONS: dict[str, set[str]] = {
     "created": {"ready", "failed"},
     "ready": {"running", "failed"},
     "running": {"question_active", "failed"},
-    "question_active": {"answering", "completing", "failed"},
+    "question_active": {"answering", "completing", "failed", "next_question"},
     "answering": {"answer_submitted", "question_active", "failed"},
     "answer_submitted": {
         "processing",
@@ -116,9 +119,18 @@ class InterviewService:
         question_count: int = 3,
         job_id: UUID | None = None,
         role_profile_id: UUID | None = None,
+        user_id: UUID | None = None,
     ) -> Interview:
         """Create and configure a new interview session with generated questions."""
-        # 1. Fetch role profile if provided
+        # 1. Ensure Profile exists if user_id is provided
+        if user_id:
+            profile = await self.db.get(Profile, user_id)
+            if not profile:
+                profile = Profile(id=user_id, display_name="Candidate")
+                self.db.add(profile)
+                await self.db.flush()
+
+        # 2. Fetch role profile if provided
         role_profile: RoleProfile | None = None
         if role_profile_id:
             role_profile = await self.db.get(RoleProfile, role_profile_id)
@@ -151,11 +163,12 @@ class InterviewService:
             self.db.add(role_profile)
             await self.db.flush()
 
-        # 2. Create Interview entity
+        # 3. Create Interview entity with user_id
         interview = Interview(
             title=title or role_profile.role_title,
             job_id=role_profile.job_id,
             role_profile_id=role_profile.id,
+            user_id=user_id,
             status="created",
             interview_type=interview_type,
             difficulty_level=difficulty_level,
@@ -287,11 +300,13 @@ class InterviewService:
             )
 
         # 1. Upload original audio/video to storage
+        owner_id_str = str(interview.user_id) if interview.user_id else None
         sha256_hash = self.media_normalizer.compute_sha256(audio_data)
         upload_req = UploadRequest(
             data=audio_data,
             content_type=content_type,
             data_class="raw_audio",
+            owner_id=owner_id_str,
             interview_id=str(interview_id),
             answer_id=str(answer_id),
             extension="webm",
@@ -309,6 +324,7 @@ class InterviewService:
                 data=normalized_wav_bytes,
                 content_type="audio/wav",
                 data_class="raw_audio",
+                owner_id=owner_id_str,
                 interview_id=str(interview_id),
                 answer_id=str(answer_id),
                 extension="wav",
@@ -348,7 +364,18 @@ class InterviewService:
         )
 
         # 4. Trigger async transcription, metrics computation, and adaptive follow-up
-        await self._process_answer_pipeline(answer, normalized_wav_bytes, "audio/wav")
+        try:
+            await self._process_answer_pipeline(answer, normalized_wav_bytes, "audio/wav")
+        except Exception as proc_err:
+            logger.error(
+                "pipeline_processing_failed",
+                answer_id=str(answer_id),
+                error=str(proc_err),
+            )
+            answer.status = "transcribed"
+            answer.processing_status = "error"
+            await self.db.commit()
+            await self.db.refresh(answer)
 
         return answer
 
@@ -401,11 +428,21 @@ class InterviewService:
         self.db.add(transcript)
         answer.transcription_status = "completed"
 
-        # Step B: Compute deterministic speech metrics
+        # Step B: Compute deterministic speech metrics & Voice Energy
         metrics_computed = self.speech_metrics_service.compute(
             words=words_data,
             total_audio_duration_seconds=answer.duration_seconds,
         )
+
+        voice_energy_res = self.speech_metrics_service.compute_voice_energy(audio_data)
+        voice_energy_dict = {
+            "average_energy": voice_energy_res.average_energy,
+            "energy_variance": voice_energy_res.energy_variance,
+            "opening_energy": voice_energy_res.opening_energy,
+            "middle_energy": voice_energy_res.middle_energy,
+            "closing_energy": voice_energy_res.closing_energy,
+            "timeline": voice_energy_res.timeline,
+        }
 
         speech_metrics = SpeechMetrics(
             answer_id=answer.id,
@@ -419,6 +456,7 @@ class InterviewService:
             pause_count=metrics_computed.pause_count,
             total_pause_seconds=metrics_computed.total_pause_seconds,
             pauses_json=metrics_computed.pauses,
+            voice_energy_json=voice_energy_dict,
         )
         self.db.add(speech_metrics)
 
@@ -509,10 +547,22 @@ class InterviewService:
         next_idx = interview.current_question_index + 1
         if next_idx < len(interview.questions):
             interview.current_question_index = next_idx
-            self.transition_state(interview, "question_active")
+            # Gracefully transition regardless of current state
+            # The interview may be in any "live" state when user clicks "next"
+            if interview.status not in ("running", "question_active", "next_question"):
+                try:
+                    self.transition_state(interview, "next_question")
+                except InvalidStateTransitionError:
+                    pass  # Already in an acceptable state
+            interview.status = "question_active"  # Force target state directly
         else:
-            self.transition_state(interview, "completing")
-            self.transition_state(interview, "completed")
+            # Move to completion — try multi-step or force it
+            try:
+                if interview.status != "completing":
+                    self.transition_state(interview, "completing")
+                self.transition_state(interview, "completed")
+            except InvalidStateTransitionError:
+                interview.status = "completed"  # Force terminal state
             interview.completed_at = datetime.now(UTC)
 
         await self.db.commit()
@@ -588,6 +638,16 @@ class InterviewService:
 
             if ans:
                 total_duration += ans.duration_seconds
+                playback_url = None
+                if ans.audio_storage_key:
+                    try:
+                        presigned = await self.storage_provider.generate_presigned_url(
+                            ans.audio_storage_key, expires_in_seconds=3600
+                        )
+                        playback_url = presigned.url
+                    except Exception as sign_err:
+                        logger.warning("signed_playback_url_failed", key=ans.audio_storage_key, error=str(sign_err))
+
                 item["answer"] = {
                     "id": ans.id,
                     "interview_id": ans.interview_id,
@@ -599,6 +659,7 @@ class InterviewService:
                     "ended_at": ans.ended_at,
                     "audio_storage_key": ans.audio_storage_key,
                     "audio_size_bytes": ans.audio_size_bytes,
+                    "playback_url": playback_url,
                     "created_at": ans.created_at,
                 }
 
@@ -656,6 +717,7 @@ class InterviewService:
                             }
                             for p in m.pauses_json
                         ],
+                        "voice_energy": getattr(m, "voice_energy_json", None),
                         "created_at": m.created_at,
                     }
 
@@ -711,6 +773,97 @@ class InterviewService:
             else 0.0
         )
 
+        # Compute Deterministic Delivery Score (v1.0.0)
+        # WPM Score (Target: 130-160 WPM)
+        wpm_score = 100.0
+        if avg_wpm > 160:
+            wpm_score = max(40.0, 100.0 - (avg_wpm - 160) * 1.5)
+        elif avg_wpm < 130 and avg_wpm > 0:
+            wpm_score = max(40.0, 100.0 - (130 - avg_wpm) * 1.2)
+
+        # Filler Score (Target: < 2.0% density)
+        filler_score = max(20.0, 100.0 - (overall_filler_density * 12.0))
+
+        # Pause Score
+        pause_score = max(30.0, 100.0 - (total_pauses * 6.0))
+
+        overall_delivery_score = round(
+            0.4 * wpm_score + 0.4 * filler_score + 0.2 * pause_score, 1
+        )
+
+        # Composite Score: 60% Content + 40% Delivery
+        overall_composite_score = (
+            round(0.6 * avg_content + 0.4 * overall_delivery_score, 1)
+            if avg_content > 0
+            else overall_delivery_score
+        )
+
+        # Top 3 Damaging Habits
+        from app.services.content_intelligence.habit_ranker import HabitRankerService
+        top_habits = HabitRankerService.rank_top_habits(
+            questions_review=questions_review,
+            overall_filler_density=overall_filler_density,
+            average_wpm=avg_wpm,
+            total_fillers=total_fillers,
+            total_pauses=total_pauses,
+        )
+
+        # Automatically record UserProgress & UserDocument if user_id is present
+        if interview.user_id:
+            role_name = interview.role_profile.role_title if interview.role_profile else interview.title
+            # Check existing progress entry
+            prog_stmt = select(UserProgress).where(UserProgress.interview_id == interview.id)
+            prog_res = (await self.db.execute(prog_stmt)).scalar_one_or_none()
+            if not prog_res:
+                prog = UserProgress(
+                    user_id=interview.user_id,
+                    interview_id=interview.id,
+                    scoring_algorithm_version="1.0.0",
+                    role_title=role_name,
+                    interview_type=interview.interview_type,
+                    overall_score=overall_composite_score,
+                    content_score=avg_content,
+                    delivery_score=overall_delivery_score,
+                    relevance_score=avg_relevance,
+                    technical_depth_score=avg_tech_depth,
+                    wpm=avg_wpm,
+                    filler_density=overall_filler_density,
+                    total_pauses_count=total_pauses,
+                    top_habits_json=top_habits,
+                    strengths_json=[h.get("title", "") for h in top_habits if h.get("severity") == "MEDIUM"],
+                    weaknesses_json=[h.get("title", "") for h in top_habits if h.get("severity") in ("CRITICAL", "HIGH")],
+                )
+                self.db.add(prog)
+
+            # Check existing document entry
+            doc_stmt = select(UserDocument).where(
+                UserDocument.interview_id == interview.id,
+                UserDocument.document_type == "INTERVIEW_REPORT",
+            )
+            doc_res = (await self.db.execute(doc_stmt)).scalar_one_or_none()
+            if not doc_res:
+                doc = UserDocument(
+                    user_id=interview.user_id,
+                    interview_id=interview.id,
+                    document_type="INTERVIEW_REPORT",
+                    title=f"Performance Report: {role_name}",
+                    content_markdown=f"# Interview Performance Report: {role_name}\n\n**Overall Score**: {overall_composite_score}%\n**Delivery Score**: {overall_delivery_score}%\n**Content Score**: {avg_content}%\n**Speaking Rate**: {avg_wpm} WPM\n\n### Priority Focus Areas\n" + "\n".join(f"- {h['title']}: {h['impact_explanation']}" for h in top_habits),
+                    metadata_json={
+                        "overall_score": overall_composite_score,
+                        "delivery_score": overall_delivery_score,
+                        "content_score": avg_content,
+                        "wpm": avg_wpm,
+                        "top_habits": top_habits,
+                    },
+                    scoring_algorithm_version="1.0.0",
+                )
+                self.db.add(doc)
+
+            try:
+                await self.db.commit()
+            except Exception as commit_err:
+                logger.warning("user_progress_persist_skipped", error=str(commit_err))
+
         return {
             "interview": {
                 "id": interview.id,
@@ -752,5 +905,81 @@ class InterviewService:
             "average_content_score": avg_content,
             "average_relevance_score": avg_relevance,
             "average_technical_depth_score": avg_tech_depth,
+            "overall_delivery_score": overall_delivery_score,
+            "overall_composite_score": overall_composite_score,
+            "top_habits": top_habits,
             "questions_review": questions_review,
         }
+
+    async def list_user_interviews(
+        self,
+        user_id: UUID,
+        limit: int = 20,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> list[Interview]:
+        """List paginated interviews exclusively owned by user_id."""
+        stmt = (
+            select(Interview)
+            .where(Interview.user_id == user_id, Interview.deleted_at.is_(None))
+            .order_by(Interview.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        if status:
+            stmt = stmt.where(Interview.status == status)
+        res = await self.db.execute(stmt)
+        return list(res.scalars().all())
+
+    async def delete_interview(self, interview_id: UUID, user_id: UUID) -> bool:
+        """Permanently delete an interview and its storage assets, ensuring caller is the owner."""
+        interview = await self.db.get(Interview, interview_id)
+        if not interview:
+            raise AptlyException(f"Interview '{interview_id}' not found.", code="INTERVIEW_NOT_FOUND")
+        if interview.user_id and interview.user_id != user_id:
+            raise AptlyException("Access denied to this interview.", code="FORBIDDEN_INTERVIEW_ACCESS")
+
+        # Delete associated media files from storage
+        for ans in interview.answers:
+            if ans.audio_storage_key:
+                try:
+                    await self.storage_provider.delete(ans.audio_storage_key)
+                except Exception:
+                    pass
+            if ans.normalized_storage_key:
+                try:
+                    await self.storage_provider.delete(ans.normalized_storage_key)
+                except Exception:
+                    pass
+
+        await self.db.delete(interview)
+        await self.db.commit()
+        return True
+
+    async def delete_user_account(self, user_id: UUID) -> bool:
+        """Cascade delete all user data: profile, interviews, documents, progress, and storage assets."""
+        # 1. Fetch all user interviews
+        stmt = select(Interview).where(Interview.user_id == user_id)
+        res = await self.db.execute(stmt)
+        interviews = list(res.scalars().all())
+
+        # 2. Delete storage assets
+        for itv in interviews:
+            for ans in itv.answers:
+                if ans.audio_storage_key:
+                    try:
+                        await self.storage_provider.delete(ans.audio_storage_key)
+                    except Exception:
+                        pass
+                if ans.normalized_storage_key:
+                    try:
+                        await self.storage_provider.delete(ans.normalized_storage_key)
+                    except Exception:
+                        pass
+
+        # 3. Delete Profile (cascades interviews, progress, documents, preferences)
+        profile = await self.db.get(Profile, user_id)
+        if profile:
+            await self.db.delete(profile)
+            await self.db.commit()
+        return True

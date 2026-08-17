@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, Mic, VideoOff } from "lucide-react";
 
 interface VideoPreviewProps {
@@ -21,18 +21,57 @@ export function VideoPreview({
   className = "",
 }: VideoPreviewProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [videoWidth, setVideoWidth] = useState(0);
+  const [videoHeight, setVideoHeight] = useState(0);
 
-  // Callback ref ensures live stream is attached immediately when the DOM node mounts
+  // Attach stream to video element — handles both initial mount and stream updates
+  const attachStream = useCallback(
+    async (node: HTMLVideoElement, mediaStream: MediaStream) => {
+      if (node.srcObject === mediaStream) return; // Already attached
+      node.srcObject = mediaStream;
+      node.muted = true;
+      try {
+        await node.play();
+      } catch {
+        // Autoplay policy may block — re-try on user interaction; not fatal
+      }
+    },
+    [],
+  );
+
+  // Callback ref: fires when the DOM node mounts
   const handleVideoMount = useCallback(
     (node: HTMLVideoElement | null) => {
       videoRef.current = node;
       if (node && stream && !recordedUrl) {
-        node.srcObject = stream;
-        node.play().catch(() => {});
+        void attachStream(node, stream);
       }
     },
-    [stream, recordedUrl],
+    // intentionally NOT including stream here — we use the useEffect below for stream updates
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [recordedUrl],
   );
+
+  // Effect: re-attach when stream arrives asynchronously AFTER the DOM node is already mounted
+  useEffect(() => {
+    const node = videoRef.current;
+    if (!node || !stream || recordedUrl) return;
+
+    void attachStream(node, stream);
+
+    const handleMetadata = () => {
+      setVideoWidth(node.videoWidth);
+      setVideoHeight(node.videoHeight);
+    };
+    node.addEventListener("loadedmetadata", handleMetadata);
+    return () => {
+      node.removeEventListener("loadedmetadata", handleMetadata);
+    };
+  }, [stream, recordedUrl, attachStream]);
+
+  // Actual camera-ready check: only true if we have a live video track AND the video element
+  // is actually rendering frames (videoWidth > 0 after metadata loads)
+  const isActuallyCameraReady = isCameraReady && (videoWidth > 0 || !stream);
 
   return (
     <div
@@ -50,6 +89,11 @@ export function VideoPreview({
               muted
               playsInline
               className="h-full w-full object-cover -scale-x-100"
+              onLoadedMetadata={(e) => {
+                const v = e.currentTarget;
+                setVideoWidth(v.videoWidth);
+                setVideoHeight(v.videoHeight);
+              }}
             />
           ) : (
             <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-slate-500">
@@ -71,13 +115,19 @@ export function VideoPreview({
           <div className="flex items-center gap-2">
             <div
               className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] font-mono font-medium backdrop-blur-md ${
-                isCameraReady
+                isActuallyCameraReady
                   ? "bg-emerald-950/80 text-emerald-300 border border-emerald-500/40"
                   : "bg-slate-900/80 text-slate-400 border border-slate-700"
               }`}
             >
               <Camera className="h-3 w-3" />
-              <span>{isCameraReady ? "CAM READY" : "NO CAM"}</span>
+              <span>
+                {isActuallyCameraReady
+                  ? `CAM ${videoWidth > 0 ? `${videoWidth}×${videoHeight}` : "READY"}`
+                  : stream
+                  ? "CAM INIT..."
+                  : "NO CAM"}
+              </span>
             </div>
 
             <div
@@ -96,7 +146,7 @@ export function VideoPreview({
           {isRecording && (
             <div className="flex items-center gap-2 rounded-lg bg-red-950/90 border border-red-500/60 px-3 py-1 text-xs font-bold text-red-300 animate-pulse backdrop-blur-md">
               <span className="h-2 w-2 rounded-full bg-red-500 animate-ping" />
-              <span>REC 720p</span>
+              <span>🔴 REC</span>
             </div>
           )}
         </div>
@@ -106,9 +156,11 @@ export function VideoPreview({
           <span className="bg-slate-950/80 px-2 py-0.5 rounded border border-slate-800 backdrop-blur-sm">
             {recordedUrl ? "RECORDED PLAYBACK" : "LIVE CAMERA FEED"}
           </span>
-          <span className="bg-slate-950/80 px-2 py-0.5 rounded border border-slate-800 backdrop-blur-sm">
-            Phase 1 Multimodal Capture
-          </span>
+          {videoWidth > 0 && !recordedUrl && (
+            <span className="bg-slate-950/80 px-2 py-0.5 rounded border border-slate-800 backdrop-blur-sm">
+              {videoWidth}×{videoHeight}
+            </span>
+          )}
         </div>
       </div>
     </div>

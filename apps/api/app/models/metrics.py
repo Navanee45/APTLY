@@ -59,6 +59,11 @@ class SpeechMetrics(UUIDMixin, TimestampMixin, Base):
         JSON, nullable=False, default=list
     )
 
+    # Voice Energy Analysis
+    voice_energy_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True, default=None
+    )
+
     # Relationships
     answer: Mapped[Answer] = relationship(
         "Answer", back_populates="speech_metrics", lazy="selectin"

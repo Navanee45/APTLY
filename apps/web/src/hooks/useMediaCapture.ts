@@ -2,17 +2,50 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+export type RecordingLifecycleState =
+  | "IDLE"
+  | "PREPARING"
+  | "READY"
+  | "RECORDING"
+  | "STOPPING"
+  | "RECORDED"
+  | "UPLOADING"
+  | "UPLOADED"
+  | "PROCESSING"
+  | "COMPLETED"
+  | "FAILED";
+
+export type PermissionStatus = "granted" | "denied" | "prompt" | "unsupported";
+
 export interface UseMediaCaptureOptions {
   enableVideo?: boolean;
   enableAudio?: boolean;
 }
 
 export interface MediaCaptureState {
+  // Explicit State Machine
+  recordingState: RecordingLifecycleState;
+  setRecordingState: (state: RecordingLifecycleState) => void;
   isRecording: boolean;
+
+  // Device Readiness
   isCameraReady: boolean;
   isMicReady: boolean;
   audioTrackState: "LIVE" | "ENDED" | "MUTED" | "NONE";
   videoTrackState: "LIVE" | "ENDED" | "MUTED" | "NONE";
+  cameraPermission: PermissionStatus;
+  micPermission: PermissionStatus;
+
+  // Device Enumeration & Selection
+  audioDevices: MediaDeviceInfo[];
+  videoDevices: MediaDeviceInfo[];
+  selectedAudioDeviceId: string;
+  selectedVideoDeviceId: string;
+  setSelectedAudioDeviceId: (deviceId: string) => void;
+  setSelectedVideoDeviceId: (deviceId: string) => void;
+  refreshDevices: () => Promise<void>;
+
+  // Metrics & Stream
   micLevelPercent: number;
   recordingDuration: number;
   recordedBlob: Blob | null;
@@ -21,6 +54,8 @@ export interface MediaCaptureState {
   stream: MediaStream | null;
   mimeType: string;
   error: string | null;
+
+  // Actions
   startRecording: () => Promise<void>;
   stopRecording: () => Promise<Blob | null>;
   resetRecording: () => void;
@@ -53,11 +88,19 @@ export function useMediaCapture({
   enableVideo = true,
   enableAudio = true,
 }: UseMediaCaptureOptions = {}): MediaCaptureState {
-  const [isRecording, setIsRecording] = useState(false);
+  const [recordingState, setRecordingState] = useState<RecordingLifecycleState>("IDLE");
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isMicReady, setIsMicReady] = useState(false);
   const [audioTrackState, setAudioTrackState] = useState<"LIVE" | "ENDED" | "MUTED" | "NONE">("NONE");
   const [videoTrackState, setVideoTrackState] = useState<"LIVE" | "ENDED" | "MUTED" | "NONE">("NONE");
+  const [cameraPermission, setCameraPermission] = useState<PermissionStatus>("prompt");
+  const [micPermission, setMicPermission] = useState<PermissionStatus>("prompt");
+
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>("");
+  const [selectedVideoDeviceId, setSelectedVideoDeviceId] = useState<string>("");
+
   const [micLevelPercent, setMicLevelPercent] = useState(0);
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
@@ -103,13 +146,37 @@ export function useMediaCapture({
     }
   };
 
+  // Enumerate input devices
+  const refreshDevices = useCallback(async () => {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const audios = devices.filter((d) => d.kind === "audioinput");
+      const videos = devices.filter((d) => d.kind === "videoinput");
+
+      setAudioDevices(audios);
+      setVideoDevices(videos);
+
+      if (!selectedAudioDeviceId && audios.length > 0) {
+        setSelectedAudioDeviceId(audios[0].deviceId);
+      }
+      if (!selectedVideoDeviceId && videos.length > 0) {
+        setSelectedVideoDeviceId(videos[0].deviceId);
+      }
+    } catch {
+      // ignore
+    }
+  }, [selectedAudioDeviceId, selectedVideoDeviceId]);
+
   // Setup Web Audio API volume monitor
   const setupAudioMonitoring = (mediaStream: MediaStream) => {
     try {
       const audioTracks = mediaStream.getAudioTracks();
       if (audioTracks.length === 0) return;
 
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (!AudioCtx) return;
 
       const audioCtx = new AudioCtx();
@@ -143,19 +210,36 @@ export function useMediaCapture({
     }
   };
 
-  // Initialize Media Devices on Mount
+  // Initialize Media Devices
   useEffect(() => {
     let mounted = true;
 
     async function setupStream() {
+      setRecordingState("PREPARING");
       try {
         if (!navigator.mediaDevices?.getUserMedia) {
+          setCameraPermission("unsupported");
+          setMicPermission("unsupported");
           throw new Error("Camera/Microphone capture is not supported by your browser.");
         }
 
+        const videoConstraints: MediaTrackConstraints | boolean = enableVideo
+          ? {
+              ...(typeof DEFAULT_CONSTRAINTS.video === "object" ? DEFAULT_CONSTRAINTS.video : {}),
+              ...(selectedVideoDeviceId ? { deviceId: { exact: selectedVideoDeviceId } } : {}),
+            }
+          : false;
+
+        const audioConstraints: MediaTrackConstraints | boolean = enableAudio
+          ? {
+              ...(typeof DEFAULT_CONSTRAINTS.audio === "object" ? DEFAULT_CONSTRAINTS.audio : {}),
+              ...(selectedAudioDeviceId ? { deviceId: { exact: selectedAudioDeviceId } } : {}),
+            }
+          : false;
+
         const constraints: MediaStreamConstraints = {
-          video: enableVideo ? DEFAULT_CONSTRAINTS.video : false,
-          audio: enableAudio ? DEFAULT_CONSTRAINTS.audio : false,
+          video: videoConstraints,
+          audio: audioConstraints,
         };
 
         const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -163,6 +247,11 @@ export function useMediaCapture({
         if (!mounted) {
           mediaStream.getTracks().forEach((track) => track.stop());
           return;
+        }
+
+        // Clean up previous stream
+        if (streamRef.current && streamRef.current !== mediaStream) {
+          streamRef.current.getTracks().forEach((t) => t.stop());
         }
 
         streamRef.current = mediaStream;
@@ -173,12 +262,20 @@ export function useMediaCapture({
 
         setIsCameraReady(vTracks.length > 0);
         setIsMicReady(aTracks.length > 0);
+        setCameraPermission(vTracks.length > 0 ? "granted" : "prompt");
+        setMicPermission(aTracks.length > 0 ? "granted" : "prompt");
 
-        setVideoTrackState(vTracks.length > 0 ? (vTracks[0].readyState === "live" ? "LIVE" : "ENDED") : "NONE");
-        setAudioTrackState(aTracks.length > 0 ? (aTracks[0].readyState === "live" ? "LIVE" : "ENDED") : "NONE");
+        setVideoTrackState(
+          vTracks.length > 0 ? (vTracks[0].readyState === "live" ? "LIVE" : "ENDED") : "NONE",
+        );
+        setAudioTrackState(
+          aTracks.length > 0 ? (aTracks[0].readyState === "live" ? "LIVE" : "ENDED") : "NONE",
+        );
 
         setupAudioMonitoring(mediaStream);
+        await refreshDevices();
         setError(null);
+        setRecordingState("READY");
       } catch (err: unknown) {
         if (!mounted) return;
         const msg =
@@ -188,6 +285,9 @@ export function useMediaCapture({
         setError(msg);
         setIsCameraReady(false);
         setIsMicReady(false);
+        setCameraPermission("denied");
+        setMicPermission("denied");
+        setRecordingState("FAILED");
       }
     }
 
@@ -208,7 +308,7 @@ export function useMediaCapture({
         clearInterval(timerRef.current);
       }
     };
-  }, [enableVideo, enableAudio]);
+  }, [enableVideo, enableAudio, selectedAudioDeviceId, selectedVideoDeviceId, refreshDevices]);
 
   const startRecording = useCallback(async () => {
     setError(null);
@@ -235,6 +335,7 @@ export function useMediaCapture({
         setError(
           err instanceof Error ? err.message : "Failed to activate camera/microphone.",
         );
+        setRecordingState("FAILED");
         return;
       }
     }
@@ -253,8 +354,8 @@ export function useMediaCapture({
         }
       };
 
-      recorder.start(1000); // Timeslice 1000ms
-      setIsRecording(true);
+      recorder.start(); // Continuous stream capture
+      setRecordingState("RECORDING");
       startTimeRef.current = Date.now();
       setRecordingDuration(0);
 
@@ -265,15 +366,16 @@ export function useMediaCapture({
       setError(
         err instanceof Error ? err.message : "Failed to start MediaRecorder recording.",
       );
-      setIsRecording(false);
+      setRecordingState("FAILED");
     }
   }, [recordedUrl, enableVideo, enableAudio, getSupportedMimeType]);
 
   const stopRecording = useCallback(async (): Promise<Blob | null> => {
+    setRecordingState("STOPPING");
     return new Promise((resolve) => {
       const recorder = mediaRecorderRef.current;
       if (!recorder || recorder.state === "inactive") {
-        setIsRecording(false);
+        setRecordingState("RECORDED");
         resolve(recordedBlob);
         return;
       }
@@ -292,17 +394,34 @@ export function useMediaCapture({
         setRecordedBlob(combinedBlob);
         setRecordedUrl(url);
         setSha256Hash(hash);
-        setIsRecording(false);
+        setRecordingState("RECORDED");
         resolve(combinedBlob);
       };
 
-      recorder.stop();
+      try {
+        if (recorder.state === "recording") {
+          recorder.requestData();
+        }
+        recorder.stop();
+      } catch {
+        recorder.stop();
+      }
     });
   }, [recordedBlob, mimeType]);
 
   const resetRecording = useCallback(() => {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      try {
+        recorder.stop();
+      } catch {
+        // ignore
+      }
+    }
+    mediaRecorderRef.current = null;
     if (timerRef.current) {
       clearInterval(timerRef.current);
+      timerRef.current = null;
     }
     if (recordedUrl) {
       URL.revokeObjectURL(recordedUrl);
@@ -311,17 +430,28 @@ export function useMediaCapture({
     setRecordedBlob(null);
     setRecordedUrl(null);
     setSha256Hash("");
-    setIsRecording(false);
     setRecordingDuration(0);
     setError(null);
-  }, [recordedUrl]);
+    setRecordingState(isCameraReady && isMicReady ? "READY" : "IDLE");
+  }, [recordedUrl, isCameraReady, isMicReady]);
 
   return {
-    isRecording,
+    recordingState,
+    setRecordingState,
+    isRecording: recordingState === "RECORDING",
     isCameraReady,
     isMicReady,
     audioTrackState,
     videoTrackState,
+    cameraPermission,
+    micPermission,
+    audioDevices,
+    videoDevices,
+    selectedAudioDeviceId,
+    selectedVideoDeviceId,
+    setSelectedAudioDeviceId,
+    setSelectedVideoDeviceId,
+    refreshDevices,
     micLevelPercent,
     recordingDuration,
     recordedBlob,

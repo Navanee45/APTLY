@@ -29,6 +29,7 @@ from app.dependencies import (
 )
 from app.main import create_app
 from app.models.base import Base
+import app.models  # Ensure all models are registered in Base.metadata
 from app.services.providers.mock_llm import MockLLMProvider
 from app.services.providers.mock_transcription import MockTranscriptionProvider
 from app.services.providers.mock_tts import MockTTSProvider

@@ -10,6 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import UserContext, get_current_user
 from app.core.idempotency import get_idempotency_key
 from app.dependencies import (
     get_db,
@@ -58,10 +59,11 @@ def _get_interview_service(
 )
 async def create_interview(
     payload: InterviewCreateRequest,
+    user: Annotated[UserContext, Depends(get_current_user)],
     service: InterviewService = Depends(_get_interview_service),
     idempotency_key: UUID | None = Depends(get_idempotency_key),
 ) -> InterviewDetailResponse:
-    """Create a new practice interview session."""
+    """Create a new practice interview session for the authenticated user."""
     interview = await service.create_interview(
         title=payload.title,
         interview_type=payload.interview_type,
@@ -70,6 +72,7 @@ async def create_interview(
         question_count=payload.question_count,
         job_id=payload.job_id,
         role_profile_id=payload.role_profile_id,
+        user_id=user.id,
     )
 
     detail = await service.get_interview_detail(interview.id)
@@ -80,13 +83,34 @@ async def create_interview(
 
 
 @router.get(
+    "",
+    response_model=list[InterviewDetailResponse],
+    summary="List user interviews",
+    description="Returns all interviews owned by the authenticated user with optional pagination.",
+)
+async def list_interviews(
+    user: Annotated[UserContext, Depends(get_current_user)],
+    service: InterviewService = Depends(_get_interview_service),
+    limit: int = 20,
+    offset: int = 0,
+    status_filter: str | None = None,
+) -> list[InterviewDetailResponse]:
+    """List authenticated user's interviews."""
+    interviews = await service.list_user_interviews(
+        user_id=user.id, limit=limit, offset=offset, status=status_filter
+    )
+    return [_to_detail_response(itv) for itv in interviews]
+
+
+@router.get(
     "/{interview_id}",
     response_model=InterviewDetailResponse,
     summary="Get interview details",
-    description="Fetches an interview, its active state, generated questions, and answers.",
+    description="Fetches an interview, ensuring caller is the authenticated owner.",
 )
 async def get_interview(
     interview_id: UUID,
+    user: Annotated[UserContext, Depends(get_current_user)],
     service: InterviewService = Depends(_get_interview_service),
 ) -> InterviewDetailResponse:
     """Retrieve full interview details."""
@@ -98,6 +122,12 @@ async def get_interview(
                 "code": "INTERVIEW_NOT_FOUND",
                 "message": f"Interview '{interview_id}' not found.",
             },
+        )
+    # IDOR Security Check
+    if detail.user_id and detail.user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "FORBIDDEN", "message": "Access denied to this interview."},
         )
     return _to_detail_response(detail)
 
@@ -205,15 +235,53 @@ async def finish_interview(
     "/{interview_id}/review",
     response_model=InterviewReviewResponse,
     summary="Get post-interview review",
-    description="Returns comprehensive speech metrics, transcripts, and question-by-question breakdown.",
+    description="Returns comprehensive speech metrics, transcripts, and question-by-question breakdown for the owner.",
 )
 async def get_interview_review(
     interview_id: UUID,
+    user: Annotated[UserContext, Depends(get_current_user)],
     service: InterviewService = Depends(_get_interview_service),
 ) -> InterviewReviewResponse:
-    """Retrieve post-interview review data."""
+    """Retrieve post-interview review data with IDOR verification."""
+    detail = await service.get_interview_detail(interview_id)
+    if not detail:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "INTERVIEW_NOT_FOUND", "message": f"Interview '{interview_id}' not found."},
+        )
+    if detail.user_id and detail.user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "FORBIDDEN", "message": "Access denied to this interview review."},
+        )
     review = await service.compile_review(interview_id)
     return InterviewReviewResponse(**review)
+
+
+@router.delete(
+    "/{interview_id}",
+    summary="Delete interview",
+    description="Permanently deletes an interview and all associated recordings/metrics for the owner.",
+)
+async def delete_interview(
+    interview_id: UUID,
+    user: Annotated[UserContext, Depends(get_current_user)],
+    service: InterviewService = Depends(_get_interview_service),
+) -> dict[str, Any]:
+    """Delete an interview."""
+    detail = await service.get_interview_detail(interview_id)
+    if not detail:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "INTERVIEW_NOT_FOUND", "message": f"Interview '{interview_id}' not found."},
+        )
+    if detail.user_id and detail.user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "FORBIDDEN", "message": "Access denied to this interview."},
+        )
+    await service.delete_interview(interview_id, user.id)
+    return {"status": "deleted", "interview_id": str(interview_id)}
 
 
 # ── Response Mappers ──────────────────────────────────────────────────────────
@@ -232,6 +300,9 @@ def _to_detail_response(interview: Any) -> InterviewDetailResponse:
             question_text=q.question_text,
             expected_topics=q.expected_topics,
             prompt_version=q.prompt_version,
+            question_source=getattr(q, "question_source", "generated") or "generated",
+            follow_up_depth=getattr(q, "follow_up_depth", 0) or 0,
+            target_competency=getattr(q, "target_competency", None),
         )
         for q in interview.questions
     ]

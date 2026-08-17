@@ -63,13 +63,18 @@ class RoleAnalyzerService:
             "Return valid JSON matching the schema."
         )
 
-        raw_result = await self.llm_provider.generate_structured(
-            LLMStructuredRequest(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                output_schema=schema,
+        raw_result: dict[str, Any] = {}
+        try:
+            raw_result = await self.llm_provider.generate_structured(
+                LLMStructuredRequest(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    output_schema=schema,
+                )
             )
-        )
+        except Exception as err:
+            logger.warning("role_analysis_llm_failed_using_heuristics", error=str(err)[:200])
+            raw_result = {}
 
         # 2. Extract or parse structured fields (with intelligent fallback if mock)
         parsed = self._normalize_extracted_data(

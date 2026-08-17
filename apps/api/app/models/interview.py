@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDMixin
@@ -16,7 +16,10 @@ from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDMixin
 if TYPE_CHECKING:
     from app.models.answer import Answer
     from app.models.job import Job, RoleProfile
+    from app.models.profile import Profile
+    from app.models.progress import UserProgress
     from app.models.question import Question
+    from app.models.user_document import UserDocument
 
 
 class Interview(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -28,13 +31,23 @@ class Interview(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
+    # Tenant / Ownership (Linked to profiles.id -> auth.users.id)
+    user_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("profiles.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
     # Foreign Keys
     job_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
         ForeignKey("jobs.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
     role_profile_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
         ForeignKey("role_profiles.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
@@ -64,6 +77,9 @@ class Interview(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     scoring_algorithm_version: Mapped[str] = mapped_column(String(20), nullable=False, default="1.0")
 
     # Relationships
+    profile: Mapped[Profile | None] = relationship(
+        "Profile", back_populates="interviews", lazy="selectin"
+    )
     job: Mapped[Job | None] = relationship(
         "Job", back_populates="interviews", lazy="selectin"
     )
@@ -81,6 +97,19 @@ class Interview(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
         "Answer",
         back_populates="interview",
         order_by="Answer.sequence_number",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+    progress_record: Mapped[UserProgress | None] = relationship(
+        "UserProgress",
+        back_populates="interview",
+        uselist=False,
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+    user_documents: Mapped[list[UserDocument]] = relationship(
+        "UserDocument",
+        back_populates="interview",
         lazy="selectin",
         cascade="all, delete-orphan",
     )

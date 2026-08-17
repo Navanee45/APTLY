@@ -104,6 +104,14 @@ export interface SpeechMetrics {
   pause_count: number;
   total_pause_seconds: number;
   pauses: PauseOccurrence[];
+  voice_energy?: {
+    average_energy: number;
+    energy_variance: number;
+    opening_energy: number;
+    middle_energy: number;
+    closing_energy: number;
+    timeline: Array<{ timestamp_seconds: number; energy: number }>;
+  } | null;
   created_at: string;
 }
 
@@ -207,6 +215,7 @@ export interface Answer {
   ended_at?: string | null;
   audio_storage_key?: string | null;
   audio_size_bytes?: number | null;
+  playback_url?: string | null;
   transcript?: Transcript | null;
   speech_metrics?: SpeechMetrics | null;
   content_metrics?: ContentMetrics | null;
@@ -237,6 +246,22 @@ export interface QuestionReviewItem {
   content_metrics?: ContentMetrics | null;
 }
 
+export interface TopHabitItem {
+  rank: number;
+  habit_type: string;
+  title: string;
+  severity: "CRITICAL" | "HIGH" | "MEDIUM" | string;
+  metric_value: string;
+  evidence_summary: string;
+  impact_explanation: string;
+  recommended_drill: {
+    title: string;
+    duration_seconds: number;
+    instructions: string;
+    success_criteria: string;
+  };
+}
+
 export interface InterviewReview {
   interview: {
     id: string;
@@ -260,5 +285,8 @@ export interface InterviewReview {
   average_content_score?: number;
   average_relevance_score?: number;
   average_technical_depth_score?: number;
+  overall_delivery_score?: number;
+  overall_composite_score?: number;
+  top_habits?: TopHabitItem[];
   questions_review: QuestionReviewItem[];
 }
