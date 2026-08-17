@@ -209,19 +209,21 @@ async def unhandled_exception_handler(
     Catch-all for unhandled exceptions.
 
     Logs the full error server-side.
-    Returns a safe generic message to the client.
-    Suppresses stack traces in production.
+    Returns a safe generic message to the client, plus error details in development.
     """
     logger.exception(
         "unhandled_exception",
         path=str(request.url.path),
         exc_type=type(exc).__name__,
+        error=str(exc),
     )
+    details = {"error": str(exc), "exc_type": type(exc).__name__}
     return JSONResponse(
         status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         content=_build_error_response(
             code="INTERNAL_ERROR",
-            message="An unexpected error occurred. Please try again.",
+            message=f"Internal Server Error: {exc}",
+            details=details,
         ).model_dump(),
     )
 

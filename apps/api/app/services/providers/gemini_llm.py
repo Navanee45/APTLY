@@ -144,11 +144,15 @@ class GeminiLLMProvider(LLMProvider):
                 return parsed_dict
             except Exception as exc:
                 last_err = exc
-                logger.warning("gemini_generate_structured_failed", attempt=attempt + 1, error=str(exc))
+                err_str = str(exc).lower()
+                logger.warning("gemini_generate_structured_failed", attempt=attempt + 1, error=str(exc)[:200])
+                if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
+                    # Break immediately on quota exhaustion to trigger deterministic templates without lag
+                    break
                 if attempt < 2:
-                    await asyncio.sleep(1.0 * (attempt + 1))
+                    await asyncio.sleep(0.5 * (attempt + 1))
 
-        raise ProviderError(f"Gemini generate_structured failed after retries: {last_err}") from last_err
+        raise ProviderError(f"Gemini generate_structured failed: {last_err}") from last_err
 
     async def generate_followup(
         self,
